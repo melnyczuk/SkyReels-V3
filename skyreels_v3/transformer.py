@@ -1,7 +1,8 @@
 import math
 
 import torch
-import torch.amp as amp
+
+# import torch.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
@@ -16,6 +17,12 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
+    orig_device = position.device
+    # MPS does not support float64 tensors at all, so do this tiny
+    # computation on CPU (in float64, for precision) and move the
+    # result back to the original device afterward.
+    if orig_device.type == "mps":
+        position = position.detach().to("cpu")
     position = position.type(torch.float64)
 
     # calculation
@@ -23,10 +30,15 @@ def sinusoidal_embedding_1d(dim, position):
         position, torch.pow(10000, -torch.arange(half).to(position).div(half))
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    if orig_device.type == "mps":
+        # x is still float64 here (from the CPU computation above) — MPS
+        # can't hold float64 tensors at all, so the dtype cast has to happen
+        # in the same .to() call as the device move, not after it.
+        x = x.to(dtype=torch.float32, device=orig_device)
     return x
 
 
-@amp.autocast("cuda", enabled=False)
+# @amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -37,7 +49,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@amp.autocast("cuda", enabled=False)
+# @amp.autocast("cuda", enabled=False)
 def rope_apply(
     x,
     grid_sizes,
@@ -411,11 +423,11 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        with amp.autocast("cuda", dtype=torch.float32):
-            e = (self.modulation.unsqueeze(2) + e.transpose(1, 2)).chunk(6, dim=1)
-            e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 6
-            expand_rate = x.shape[1] // e[0].shape[1]
-            assert x.shape[1] % e[0].shape[1] == 0
+        # with amp.autocast("cuda", dtype=torch.float32):
+        e = (self.modulation.unsqueeze(2) + e.transpose(1, 2)).chunk(6, dim=1)
+        e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 6
+        expand_rate = x.shape[1] // e[0].shape[1]
+        assert x.shape[1] % e[0].shape[1] == 0
 
         # self-attention
         y = self.self_attn(
@@ -430,12 +442,12 @@ class WanAttentionBlock(nn.Module):
             num_frame_list,
             grid_size_list,
         )
-        with amp.autocast("cuda", dtype=torch.float32):
-            x = mul_add(
-                x.unflatten(1, (-1, expand_rate)),
-                y.unflatten(1, (-1, expand_rate)),
-                e[2],
-            ).flatten(1, 2)
+        # with amp.autocast("cuda", dtype=torch.float32):
+        x = mul_add(
+            x.unflatten(1, (-1, expand_rate)),
+            y.unflatten(1, (-1, expand_rate)),
+            e[2],
+        ).flatten(1, 2)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, e):
@@ -445,12 +457,12 @@ class WanAttentionBlock(nn.Module):
                     self.norm2(x).unflatten(1, (-1, expand_rate)), e[4], e[3]
                 ).flatten(1, 2)
             )
-            with amp.autocast("cuda", dtype=torch.float32):
-                x = mul_add(
-                    x.unflatten(1, (-1, expand_rate)),
-                    y.unflatten(1, (-1, expand_rate)),
-                    e[5],
-                ).flatten(1, 2)
+            # with amp.autocast("cuda", dtype=torch.float32):
+            x = mul_add(
+                x.unflatten(1, (-1, expand_rate)),
+                y.unflatten(1, (-1, expand_rate)),
+                e[5],
+            ).flatten(1, 2)
             return x
 
         x = cross_attn_ffn(x, context, e)
@@ -479,11 +491,11 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        with amp.autocast("cuda", dtype=torch.float32):
-            e = (self.modulation.unsqueeze(2) + e.unsqueeze(1)).chunk(2, dim=1)
-            e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 2
-            expand_rate = x.shape[1] // e[0].shape[1]
-            assert x.shape[1] % e[0].shape[1] == 0
+        # with amp.autocast("cuda", dtype=torch.float32):
+        e = (self.modulation.unsqueeze(2) + e.unsqueeze(1)).chunk(2, dim=1)
+        e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 2
+        expand_rate = x.shape[1] // e[0].shape[1]
+        assert x.shape[1] % e[0].shape[1] == 0
         x = self.head(
             mul_add_add(
                 self.norm(x).unflatten(1, (-1, expand_rate)), e[1], e[0]
@@ -705,45 +717,61 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         """
         if self.model_type == "i2v":
             assert clip_fea is not None and y is not None
-        
+
         if block_offload:
-            self.patch_embedding.to("cuda")
-            self.text_embedding.to("cuda")
-            self.time_embedding.to("cuda")
-            self.time_projection.to("cuda")
+            self.patch_embedding.to("mps")
+            self.text_embedding.to("mps")
+            self.time_embedding.to("mps")
+            self.time_projection.to("mps")
             if hasattr(self, "img_emb"):
-                self.img_emb.to("cuda")
-            self.freqs = self.freqs.to("cuda")
+                self.img_emb.to("mps")
+            self.freqs = self.freqs.to("mps")
 
             if isinstance(x, torch.Tensor):
-                x = x.to("cuda")
+                x = x.to("mps")
             elif isinstance(x, list):
-                x = [item.to("cuda") for item in x]
-            
-            t = t.to("cuda")
-            context = context.to("cuda")
+                x = [item.to("mps") for item in x]
+
+            t = t.to("mps")
+            context = context.to("mps")
             if clip_fea is not None:
-                clip_fea = clip_fea.to("cuda")
+                clip_fea = clip_fea.to("mps")
             if y is not None:
-                y = y.to("cuda")
+                y = y.to("mps")
             if block_mask is not None:
-                block_mask = block_mask.to("cuda")
+                block_mask = block_mask.to("mps")
 
         # params
         device = self.patch_embedding.weight.device
+        weight_dtype = self.patch_embedding.weight.dtype
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
-            
+
         # Ensure freqs is always on the correct device if it wasn't moved in block_offload
-        if not block_offload and self.freqs.device != x.device and isinstance(x, torch.Tensor):
-             self.freqs = self.freqs.to(x.device)
-        elif not block_offload and isinstance(x, list) and len(x) > 0 and self.freqs.device != x[0].device:
-             self.freqs = self.freqs.to(x[0].device)
+        if (
+            not block_offload
+            and self.freqs.device != x.device
+            and isinstance(x, torch.Tensor)
+        ):
+            self.freqs = self.freqs.to(x.device)
+        elif (
+            not block_offload
+            and isinstance(x, list)
+            and len(x) > 0
+            and self.freqs.device != x[0].device
+        ):
+            self.freqs = self.freqs.to(x[0].device)
 
         if isinstance(x, torch.Tensor):
+            # Cast input to the patch_embedding weight's dtype (e.g. bf16)
+            # before running the conv. Without this, MPS (which has no
+            # implicit autocast for conv3d the way CUDA does) will throw
+            # "Input type (float) and bias type (BFloat16) should be the same".
+            x = x.to(weight_dtype)
             if y is not None:
                 if y.device != x.device:
                     y = y.to(x.device)
+                y = y.to(weight_dtype)
                 x = torch.cat([x, y], dim=1)
 
             # embeddings
@@ -756,6 +784,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             num_token_list = []
         else:
             # list of tensors path (transformer_2)
+            x = [item.to(weight_dtype) for item in x]
             x = [self.patch_embedding(item) for item in x]
             grid_size_list = [
                 torch.tensor(item.shape[2:], dtype=torch.long) for item in x[1:]
@@ -771,19 +800,22 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             x = torch.cat(x, dim=1)
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
-            b, f = t.shape
+        # with amp.autocast("cuda", dtype=torch.float32):
+        b, f = t.shape
 
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(
-                    self.patch_embedding.weight.dtype
-                )
-            )  # b, dim
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))  # b, 6, dim
-            e = e.view(b, f, -1)
-            e0 = e0.view(b, f, 6, self.dim)
-
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(weight_dtype)
+        )  # b, dim
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))  # b, 6, dim
+        # On CUDA, a `torch.amp.autocast("cuda", dtype=torch.float32)` context
+        # (now commented out below/above) used to force this computation up
+        # to float32 regardless of the model's bf16 weights. MPS has no
+        # equivalent implicit upcast here, so time_embedding/time_projection
+        # now genuinely run in bf16 and produce bf16 output. Cast explicitly
+        # instead of asserting float32, since downstream code (mul_add,
+        # mul_add_add) already mixes precision safely via .float().
+        e = e.view(b, f, -1).float()
+        e0 = e0.view(b, f, 6, self.dim).float()
 
         # context
         context = self.text_embedding(context)
@@ -799,7 +831,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.time_projection.to("cpu")
             if hasattr(self, "img_emb"):
                 self.img_emb.to("cpu")
-            torch.cuda.empty_cache()
+            torch.mps.empty_cache()
 
         # arguments
         kwargs = dict(
@@ -816,8 +848,8 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if block_offload:
             for i, block in enumerate(self.blocks):
-                block.to("cuda")
-                
+                block.to("mps")
+
                 if torch.is_grad_enabled() and self.gradient_checkpointing:
                     x = self._gradient_checkpointing_func(
                         block,
@@ -826,21 +858,21 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     )
                 else:
                     x = block(x, **kwargs)
-                
+
                 block.to("cpu")
-                torch.cuda.empty_cache()
+                torch.mps.empty_cache()
         else:
             for block in self.blocks:
                 x = block(x, **kwargs)
 
         if block_offload:
-            self.head.to("cuda")
+            self.head.to("mps")
 
         x = self.head(x, e)
 
         if block_offload:
             self.head.to("cpu")
-            torch.cuda.empty_cache()
+            torch.mps.empty_cache()
 
         if len(num_token_list) > 0:
             num_context_token = sum(num_token_list)

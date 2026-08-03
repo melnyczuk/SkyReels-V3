@@ -1,0 +1,40 @@
+[project]
+authors = [
+  {name = "How", email = "how@melnycz.uk"},
+]
+dependencies = [
+  "accelerate==1.8.1",
+  "av>=18.0.0",
+  "diffusers==0.34.0",
+  "easydict>=1.13",
+  "ftfy==6.3.1",
+  "imageio-ffmpeg==0.5.1",
+  "kornia>=0.8.3",
+  "librosa>=0.11.0",
+  "moviepy==2.2.1",
+  "numpy==1.26.4",
+  "omegaconf==2.3.0",
+  "opencv-python==4.11.0.86",
+  "pyloudnorm>=0.2.0",
+  "tokenizers==0.21.4",
+  "torch==2.13.0",
+  "torchao==0.10.0",
+  "torchvision==0.28.0",
+  "tqdm==4.67.1",
+  "transformers==4.53.2",
+  "wget==3.2",
+  "xfuser==0.4.3.post3",
+  "yunchang==0.6.3.post1",
+]
+description = "Add your description here"
+name = "skyreels-v3"
+readme = "README.md"
+requires-python = ">=3.13"
+version = "0.1.0"
+
+[project.scripts]
+skyreels-v3 = "skyreels_v3:main"
+
+[build-system]
+build-backend = "uv_build"
+requires = ["uv_build>=0.12.0,<0.13.0"]

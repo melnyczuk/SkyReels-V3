@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..config import ASPECT_RATIO_CONFIG
+from .config import ASPECT_RATIO_CONFIG
 
 
 def get_prefix_and_raw_video(input_video_path: str, num_condition_frames: int):

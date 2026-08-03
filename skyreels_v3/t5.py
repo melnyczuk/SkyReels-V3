@@ -543,6 +543,9 @@ class T5EncoderModel(ModelMixin):
         else:
             self.model.eval().requires_grad_(False)
         # init tokenizer
+        # NOTE: no `device=` kwarg here — HuggingfaceTokenizer forwards **kwargs
+        # straight into AutoTokenizer.from_pretrained(), which isn't device-aware
+        # and doesn't accept one. Tokenization always runs on CPU regardless.
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean="whitespace"
         )
@@ -553,6 +556,6 @@ class T5EncoderModel(ModelMixin):
         mask = mask.to(self.device)
         # seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.model(ids, mask)
-        context = context * mask.unsqueeze(-1).cuda()
+        context = context * mask.unsqueeze(-1).to(self.device)
 
         return context

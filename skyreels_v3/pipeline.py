@@ -8,9 +8,9 @@ import torch
 from diffusers.video_processor import VideoProcessor
 from tqdm import tqdm
 
-from ..modules import get_text_encoder, get_transformer, get_vae
-from ..scheduler.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from ..utils.util import get_video_info
+from .modules import get_text_encoder, get_transformer, get_vae
+from .scheduler import FlowUniPCMultistepScheduler
+from .utils import get_video_info
 
 
 def split_m_n(m, n):
@@ -31,9 +31,8 @@ class SingleShotExtensionPipeline:
     def __init__(
         self,
         model_path: str,
-        device: str = "cuda",
+        device: str = "mps",
         weight_dtype=torch.bfloat16,
-        use_usp=False,
         offload=False,
         low_vram=False,
     ):
@@ -42,7 +41,7 @@ class SingleShotExtensionPipeline:
 
         Args:
             model_path (str): Path to the model
-            device (str): Device to run on, defaults to 'cuda'
+            device (str): Device to run on, defaults to 'mps'
             weight_dtype: Weight data type, defaults to torch.bfloat16
         """
         offload = offload or low_vram
@@ -63,27 +62,6 @@ class SingleShotExtensionPipeline:
         self.device = device
         self.offload = offload
         self.low_vram = low_vram
-        self.sp_size = 1
-        self.use_usp = use_usp
-
-        if self.use_usp:
-            import types
-
-            from xfuser.core.distributed import get_sequence_parallel_world_size
-
-            from ..distributed.context_parallel_for_extension import (
-                usp_attn_forward,
-                usp_dit_forward,
-            )
-
-            for block in self.transformer.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn
-                )
-                self.transformer.forward = types.MethodType(
-                    usp_dit_forward, self.transformer
-                )
-                self.sp_size = get_sequence_parallel_world_size()
 
         self.scheduler = FlowUniPCMultistepScheduler()
         self.vae_stride = (4, 8, 8)
@@ -116,7 +94,7 @@ class SingleShotExtensionPipeline:
             raw_video, num_condition_frames, resolution
         )
 
-        generatetime_list = split_m_n(duration, 5)
+        generatetime_list = split_m_n(duration, 2)
         output_video_frames = []
 
         prefix_video = prefix_video.to(self.device)
@@ -212,7 +190,7 @@ class SingleShotExtensionPipeline:
         if self.offload:
             self.text_encoder.to("cpu")
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.mps.empty_cache()
 
         latents = [
             torch.randn(
@@ -231,7 +209,10 @@ class SingleShotExtensionPipeline:
 
         logging.info(f"start transformer forward, latents: {latents[0].shape}")
 
-        with torch.cuda.amp.autocast(dtype=self.transformer.dtype), torch.no_grad():
+        with (
+            # torch.device("mps").amp.autocast(dtype=self.transformer.dtype),
+            torch.no_grad(),
+        ):
             self.scheduler.set_timesteps(
                 num_inference_steps, device=self.device, shift=shift
             )
@@ -244,15 +225,22 @@ class SingleShotExtensionPipeline:
                     latent_model_input = torch.cat(
                         [kwargs["condition"], latent_model_input], 2
                     )
+                latent_model_input = latent_model_input.to(self.transformer.dtype)
                 timestep = timestep.view(1, 1).repeat(1, latent_model_input.shape[2])
                 if "condition" in kwargs:
                     timestep[:, : kwargs["condition"].shape[2]] = 0
                 if self.do_classifier_free_guidance:
                     noise_pred_cond = self.transformer(
-                        latent_model_input, t=timestep, context=context, block_offload=block_offload
+                        latent_model_input,
+                        t=timestep,
+                        context=context,
+                        block_offload=block_offload,
                     )[0]
                     noise_pred_uncond = self.transformer(
-                        latent_model_input, t=timestep, context=context_null, block_offload=block_offload
+                        latent_model_input,
+                        t=timestep,
+                        context=context_null,
+                        block_offload=block_offload,
                     )[0]
 
                     noise_pred = noise_pred_uncond + guidance_scale * (
@@ -261,7 +249,10 @@ class SingleShotExtensionPipeline:
                 else:
                     # CFG distilled
                     noise_pred = self.transformer(
-                        latent_model_input, t=timestep, context=context, block_offload=block_offload
+                        latent_model_input,
+                        t=timestep,
+                        context=context,
+                        block_offload=block_offload,
                     )[0]
                 if "condition" in kwargs:
                     noise_pred = noise_pred[:, -latents[0].shape[1] :]
@@ -276,13 +267,13 @@ class SingleShotExtensionPipeline:
                 latents = [temp_x0.squeeze(0)]
                 if block_offload:
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    torch.mps.empty_cache()
             logging.info(
                 f"finish transformer forward, latents: {latents[0].shape}, {latents[0].device}"
             )
             if self.offload:
                 self.transformer.cpu()
-                torch.cuda.empty_cache()
+                torch.mps.empty_cache()
             if "condition" in kwargs:
                 videos = self.vae.decode(
                     torch.cat([kwargs["condition"], latents[0].unsqueeze(0)], 2)[0]
@@ -296,5 +287,5 @@ class SingleShotExtensionPipeline:
             videos = [video.cpu().numpy().astype(np.uint8) for video in videos]
         if self.offload:
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.mps.empty_cache()
         return videos
