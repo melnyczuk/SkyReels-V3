@@ -4,11 +4,31 @@ import torch
 
 # import torch.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import attention
+
+
+# --- TEMPORARY DEBUG INSTRUMENTATION (round 2) ---
+# Round 1 confirmed self_attn (including attention() itself) is NOT at
+# fault, and found + fixed a missing dtype cast in WanT2VCrossAttention.
+# That fix did not resolve the crash, so it wasn't the whole picture (or
+# wasn't it at all) — extending checkpoints further this time: inside
+# cross_attn's own internals, through ffn, and past the end of the block,
+# rather than guessing again.
+def _dbg_sync(label):
+    if 0:
+        print(f"[DEBUG SYNC] about to sync after: {label}", flush=True)
+        if torch.backends.mps.is_available():
+            torch.mps.synchronize()
+        print(f"[DEBUG SYNC] survived: {label}", flush=True)
+
+
+# --- END TEMPORARY DEBUG INSTRUMENTATION ---
+
 
 __all__ = ["WanModel"]
 
@@ -61,6 +81,8 @@ def rope_apply(
 ):
     n, c = x.size(2), x.size(3) // 2
     bs = x.size(0)
+    orig_dtype = x.dtype  # rope math below runs in float32 for the complex
+    # rotation; restore this dtype before returning so q/k match v's dtype.
 
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -169,13 +191,19 @@ def rope_apply(
         ).reshape(seq_len, 1, -1)
         x = torch.view_as_real(x * freqs_i).flatten(3)
 
-    return x
+    return x.to(orig_dtype)
 
 
 def fast_rms_norm(x, weight, eps):
     x = x.float()
     x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-    x = x.type_as(x) * weight
+    # NOTE: this was `x.type_as(x)`, a no-op that silently left the output in
+    # float32 instead of casting back to the model's working dtype (bf16/fp16).
+    # Under the old attention() that force-cast q/k/v to a hardcoded bf16 no
+    # matter what, this went unnoticed; with that force-cast removed, q/k
+    # (which pass through this norm) and v (which doesn't) would otherwise
+    # end up in different dtypes and fail the SDPA dtype check.
+    x = x.type_as(weight) * weight
     return x
 
 
@@ -206,7 +234,27 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x)
+        # PyTorch's MPS backend has long-standing, documented bugs running
+        # LayerNorm directly on float16 input (e.g. pytorch/pytorch#96113,
+        # huggingface/diffusers#2521) — internally its variance computation
+        # can end up in a different dtype than its output buffer, which can
+        # surface as a native Metal assertion failure. Because MPS dispatches
+        # GPU work asynchronously, that crash can appear to originate from a
+        # completely different, later op that happened to force a sync —
+        # which is exactly what we saw here (the same crash from three
+        # different attention implementations). fast_rms_norm already
+        # upcasts to float32 for exactly this kind of reason; this class
+        # never did, so it's forced explicitly here instead of relying on
+        # nn.LayerNorm's default behavior on whatever dtype x arrives in.
+        orig_dtype = x.dtype
+        out = F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return out.to(orig_dtype)
 
 
 class WanSelfAttention(nn.Module):
@@ -294,17 +342,34 @@ class WanT2VCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
+        # x arrives as float32 here (mul_add() upstream always upcasts to
+        # float32 unconditionally), but self.q/self.k/self.v are fp16/bf16
+        # weights. WanSelfAttention.forward casts x to the weight's dtype
+        # before its own Linear calls; this class was missing that same
+        # cast, so self.q(x) ran a Linear with mismatched float32 input
+        # against fp16 weights — a real dtype mismatch feeding a matmul,
+        # which is what was actually causing the native MPS assertion
+        # failure (not attention itself, which was fine all along).
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
+        _dbg_sync("cross_attn: after x/context dtype cast")
+
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        _dbg_sync("cross_attn: after norm_q(q_proj(x))")
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        _dbg_sync("cross_attn: after norm_k(k_proj(context))")
         v = self.v(context).view(b, -1, n, d)
+        _dbg_sync("cross_attn: after v_proj(context)")
 
         # compute attention
         x = attention(q, k, v)
+        _dbg_sync("cross_attn: after attention()")
 
         # output
         x = x.flatten(2)
         x = self.o(x)
+        _dbg_sync("cross_attn: after output proj self.o(x)")
         return x
 
 
@@ -327,6 +392,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         context_img = context[:, :257]
         context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # See WanT2VCrossAttention.forward for why this cast is needed.
+        x = x.to(self.q.weight.dtype)
+        context = context.to(self.k.weight.dtype)
+        context_img = context_img.to(self.k_img.weight.dtype)
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
@@ -428,6 +498,7 @@ class WanAttentionBlock(nn.Module):
         e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 6
         expand_rate = x.shape[1] // e[0].shape[1]
         assert x.shape[1] % e[0].shape[1] == 0
+        _dbg_sync("block: after modulation chunk")
 
         # self-attention
         y = self.self_attn(
@@ -442,31 +513,42 @@ class WanAttentionBlock(nn.Module):
             num_frame_list,
             grid_size_list,
         )
+        _dbg_sync("block: after self_attn returned")
         # with amp.autocast("cuda", dtype=torch.float32):
         x = mul_add(
             x.unflatten(1, (-1, expand_rate)),
             y.unflatten(1, (-1, expand_rate)),
             e[2],
         ).flatten(1, 2)
+        _dbg_sync("block: after post-self-attn mul_add")
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, e):
             x = x + self.cross_attn(self.norm3(x), context)
-            y = self.ffn(
-                mul_add_add(
-                    self.norm2(x).unflatten(1, (-1, expand_rate)), e[4], e[3]
-                ).flatten(1, 2)
-            )
+            _dbg_sync("block: after cross_attn")
+            ffn_input = mul_add_add(
+                self.norm2(x).unflatten(1, (-1, expand_rate)), e[4], e[3]
+            ).flatten(1, 2)
+            # Same bug class as WanT2VCrossAttention: mul_add_add() always
+            # returns float32, but self.ffn's first Linear has fp16/bf16
+            # weights. Cast explicitly rather than relying on an implicit
+            # (and apparently, on this MPS build, crash-prone) promotion.
+            ffn_input = ffn_input.to(self.ffn[0].weight.dtype)
+            _dbg_sync("block: after ffn input dtype cast")
+            y = self.ffn(ffn_input)
+            _dbg_sync("block: after ffn")
             # with amp.autocast("cuda", dtype=torch.float32):
             x = mul_add(
                 x.unflatten(1, (-1, expand_rate)),
                 y.unflatten(1, (-1, expand_rate)),
                 e[5],
             ).flatten(1, 2)
+            _dbg_sync("block: after post-ffn mul_add")
             return x
 
         x = cross_attn_ffn(x, context, e)
-        return x.to(torch.bfloat16)
+        _dbg_sync("block: after cross_attn_ffn returned")
+        return x.to(self.modulation.dtype)
 
 
 class Head(nn.Module):
@@ -496,11 +578,14 @@ class Head(nn.Module):
         e = [e_i.transpose(1, 2) for e_i in e]  # [B, F, 1, C] * 2
         expand_rate = x.shape[1] // e[0].shape[1]
         assert x.shape[1] % e[0].shape[1] == 0
-        x = self.head(
-            mul_add_add(
-                self.norm(x).unflatten(1, (-1, expand_rate)), e[1], e[0]
-            ).flatten(1, 2)
-        )
+        # Same bug pattern as WanT2VCrossAttention / the FFN input: mul_add_add()
+        # always returns float32, but self.head is an fp16/bf16-weighted Linear.
+        # Cast explicitly before it.
+        head_input = mul_add_add(
+            self.norm(x).unflatten(1, (-1, expand_rate)), e[1], e[0]
+        ).flatten(1, 2)
+        head_input = head_input.to(self.head.weight.dtype)
+        x = self.head(head_input)
 
         return x
 
@@ -776,6 +861,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
             # embeddings
             x = self.patch_embedding(x)
+            _dbg_sync("model: after patch_embedding")
             grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
             x = x.flatten(2).transpose(1, 2)
 
@@ -806,7 +892,9 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(weight_dtype)
         )  # b, dim
+        _dbg_sync("model: after time_embedding")
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))  # b, 6, dim
+        _dbg_sync("model: after time_projection")
         # On CUDA, a `torch.amp.autocast("cuda", dtype=torch.float32)` context
         # (now commented out below/above) used to force this computation up
         # to float32 regardless of the model's bf16 weights. MPS has no
@@ -819,6 +907,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # context
         context = self.text_embedding(context)
+        _dbg_sync("model: after text_embedding")
 
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
@@ -846,6 +935,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             block_mask=block_mask,
         )
 
+        _dbg_sync("model: about to enter block loop")
         if block_offload:
             for i, block in enumerate(self.blocks):
                 block.to("mps")
@@ -858,17 +948,20 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     )
                 else:
                     x = block(x, **kwargs)
+                _dbg_sync(f"model: after block {i} (block_offload path)")
 
                 block.to("cpu")
                 torch.mps.empty_cache()
         else:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 x = block(x, **kwargs)
+                _dbg_sync(f"model: after block {i}")
 
         if block_offload:
             self.head.to("mps")
 
         x = self.head(x, e)
+        _dbg_sync("model: after head")
 
         if block_offload:
             self.head.to("cpu")
@@ -881,6 +974,7 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        _dbg_sync("model: after unpatchify")
         return x.float()
 
     def unpatchify(self, x, grid_sizes):

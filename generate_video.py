@@ -96,6 +96,27 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable low VRAM mode with block offload.",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="fp16",
+        choices=["bf16", "fp16"],
+        help="Model weight/compute dtype. bf16 is the default (matches how "
+        "the model was trained), but bf16 support on the MPS backend is "
+        "known to be less mature than fp16 and can hit native crashes in "
+        "some matmul kernels. Try --dtype fp16 if you hit an MPS assertion "
+        "failure like 'MPSNDArrayMatrixMultiplication'.",
+    )
+
+    parser.add_argument(
+        "--chunk_seconds",
+        type=int,
+        default=2,
+        help="Seconds of video generated per roll. Lower this (e.g. 2 or 3) "
+        "if you hit MPS out-of-memory errors — attention memory scales "
+        "roughly with the square of the sequence length, so smaller chunks "
+        "help a lot at the cost of more, slightly slower rolls.",
+    )
 
     # ==================== Video Extension Parameters ====================
     parser.add_argument(
@@ -127,6 +148,7 @@ if __name__ == "__main__":
         offload=args.offload,
         low_vram=args.low_vram,
         device=device,
+        weight_dtype=torch.bfloat16 if args.dtype == "bf16" else torch.float16,
     )
     video_out = pipe.extend_video(
         args.input_video,
@@ -134,6 +156,7 @@ if __name__ == "__main__":
         args.duration,
         args.seed,
         resolution=args.resolution,
+        chunk_seconds=args.chunk_seconds,
     )
 
     save_dir = os.path.join("result", "single_shot_extension")

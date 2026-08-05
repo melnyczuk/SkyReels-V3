@@ -87,14 +87,26 @@ class SingleShotExtensionPipeline:
         seed: int,
         fps: int = 24,
         resolution: str = "720P",
+        chunk_seconds: int = 5,
     ):
+        """
+        Args:
+            ...
+            chunk_seconds: seconds of video generated per roll. Smaller
+                values mean shorter attention sequences (roughly quadratic
+                memory savings per halving), at the cost of more rolls and
+                slightly more visible seams between them. Lower this first
+                if you're hitting MPS out-of-memory errors — it's the
+                single biggest lever on peak memory. 5 is the original
+                default; try 2 or 3 on constrained MPS setups.
+        """
         num_condition_frames = 25
         factor_num_frames = 6
-        prefix_video, raw_video, height, width = get_video_info(
+        prefix_video, height, width = get_video_info(
             raw_video, num_condition_frames, resolution
         )
 
-        generatetime_list = split_m_n(duration, 2)
+        generatetime_list = split_m_n(duration, chunk_seconds)
         output_video_frames = []
 
         prefix_video = prefix_video.to(self.device)
