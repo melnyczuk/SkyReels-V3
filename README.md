@@ -63,13 +63,14 @@ uv run skyreels-v3 \
 
 (or just `skyreels-v3 ...` if installed via `uv tool install .`)
 
-`--input_video` accepts a local path or a URL. Output is written to `result/single_shot_extension/`.
+`--input_video` accepts a local path or a URL. Output is written to `result/` or specified using `-output`.
 
 ### Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--input_video` | example clip | Source video to extend (path or URL) |
+| `--input_video`, `-i` | None | Source video to extend (path or URL) |
+| `--output`, `-o` | auto | Output file path. Defaults to `result/<seed>_<timestamp>.mp4` |
 | `--prompt` | example prompt | Text prompt describing the continuation |
 | `--duration` | `5` | Output duration in seconds (5–30) |
 | `--resolution` | `720P` | `480P`, `540P`, or `720P` |

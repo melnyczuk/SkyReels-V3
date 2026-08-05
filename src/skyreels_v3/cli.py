@@ -112,9 +112,20 @@ def build_parser() -> argparse.ArgumentParser:
     # ==================== Video Extension Parameters ====================
     parser.add_argument(
         "--input_video",
+        "-i",
         type=str,
-        default="https://skyreels-api.oss-accelerate.aliyuncs.com/examples/video_extension/test.mp4",
+        default=None,
         help="Input video path or URL to extend.",
+    )
+
+    # ==================== Output ====================
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output file path for the generated video. Defaults to "
+        "result/<seed>_<timestamp>.mp4.",
     )
 
     return parser
@@ -161,16 +172,21 @@ def main() -> None:
         chunk_seconds=args.chunk_seconds,
     )
 
-    save_dir = os.path.join("result", "single_shot_extension")
-    os.makedirs(save_dir, exist_ok=True)
+    if args.output:
+        output_path = args.output
+    else:
+        save_dir = os.path.join("result")
+        current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        output_path = os.path.join(save_dir, f"{args.seed}_{current_time}.mp4")
 
-    current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-    video_out_file = f"{args.seed}_{current_time}.mp4"
-    output_path = os.path.join(save_dir, video_out_file)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     imageio.mimwrite(
         output_path,
         video_out,
-        fps=24,
+        fps=25,
         quality=8,
         output_params=["-loglevel", "error"],
     )
