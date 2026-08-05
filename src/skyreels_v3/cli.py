@@ -4,21 +4,12 @@ import os
 import random
 import time
 
-# 配置日志格式和级别，实现实时终端打印
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - skyreels_v3 - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s] - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    force=True,
-    handlers=[logging.StreamHandler()],  # 显式指定输出到终端
-)
-
 import imageio
 import torch
 import wget
 
-from skyreels_v3.modules import download_model
-from skyreels_v3.pipeline import SingleShotExtensionPipeline
+from .modules import download_model
+from .pipeline import SingleShotExtensionPipeline
 
 
 def maybe_download(path_or_url: str, save_dir: str) -> str:
@@ -44,7 +35,7 @@ def maybe_download(path_or_url: str, save_dir: str) -> str:
     return local_path
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SkyReels V3: Single Shot Video Extension (MPS / local)"
     )
@@ -126,7 +117,19 @@ if __name__ == "__main__":
         help="Input video path or URL to extend.",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - skyreels_v3 - %(levelname)s - [%(filename)s:%(lineno)d - %(funcName)s] - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+        handlers=[logging.StreamHandler()],
+    )
+
+    args = build_parser().parse_args()
 
     args.model_id = "Skywork/SkyReels-V3-Video-Extension"
     device = "mps"
@@ -142,7 +145,6 @@ if __name__ == "__main__":
 
     args.input_video = maybe_download(args.input_video, "input_video")
 
-    # init pipeline
     pipe = SingleShotExtensionPipeline(
         model_path=args.model_id,
         offload=args.offload,
@@ -174,3 +176,7 @@ if __name__ == "__main__":
     )
 
     print(f"saved video to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
